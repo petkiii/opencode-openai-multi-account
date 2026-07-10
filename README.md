@@ -56,7 +56,7 @@ ooma list
 ooma import-current
 ooma add
 ooma select
-ooma remove <account>
+ooma remove
 ooma usage
 ooma version
 ```
