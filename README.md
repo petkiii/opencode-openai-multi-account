@@ -16,11 +16,11 @@ cd opencode-openai-multi-account
 npm install
 ```
 
-Add the TUI plugin to your OpenCode config, usually `~/.config/opencode/opencode.json`:
+Add the TUI plugin to your OpenCode tui config `~/.config/opencode/tui.json`:
 
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
+  "$schema": "https://opencode.ai/tui.json",
   "plugin": ["file:///absolute/path/to/opencode-openai-multi-account"]
 }
 ```
@@ -51,7 +51,7 @@ You can also use command palette and click `Manage accounts` or `Switch account`
 
 The CLI uses the `ooma` command:
 
-```bash
+```
 ooma list
 ooma import-current
 ooma add
