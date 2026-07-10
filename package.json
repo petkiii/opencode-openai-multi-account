@@ -1,0 +1,42 @@
+{
+  "name": "opencode-openai-multi-account",
+  "version": "0.1.0",
+  "description": "OpenCode TUI plugin and CLI for switching between local OpenAI OAuth accounts",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "ooma": "./dist/cli/index.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./src/plugin/tui/index.tsx"
+    },
+    "./tui": {
+      "import": "./src/plugin/tui/index.tsx"
+    }
+  },
+  "scripts": {
+    "clean": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json && node scripts/set-bin-mode.mjs",
+    "ooma": "tsx src/cli/index.ts",
+    "install:global": "npm run build && npm install -g .",
+    "test": "tsx --test test/*.test.ts",
+    "check": "npm run build && npm run test"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^8.4.2",
+    "@opentui/solid": "^0.1.102",
+    "chalk": "^5.6.2",
+    "cli-table3": "^0.6.5",
+    "commander": "^14.0.2"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.14.20",
+    "@types/node": "^22.15.29",
+    "tsx": "^4.20.6",
+    "typescript": "^5.8.3"
+  }
+}
