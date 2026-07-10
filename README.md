@@ -4,6 +4,8 @@ OpenCode TUI plugin and CLI for keeping multiple local OpenAI/ChatGPT OAuth acco
 
 Main interface is the OpenCode TUI plugin. The package also ships the `ooma` CLI, which exposes the same account-management flow.
 
+<img width="1343" height="485" alt="Account summary in TUI" src="https://github.com/user-attachments/assets/c4dd9940-abc1-4eab-8d22-761475c1ff50" />
+
 ## Install
 
 Clone the repo:
