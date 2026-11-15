@@ -1,4 +1,4 @@
-import type { StoredAccount } from "./types.js";
+import type { ListedAccount } from "./types.js";
 
 function shortenOpaque(value: string, head = 8, tail = 4): string {
   if (value.length <= head + tail + 1) return value;
@@ -6,10 +6,14 @@ function shortenOpaque(value: string, head = 8, tail = 4): string {
 }
 
 export function accountDisplayName(
-  account: Pick<StoredAccount, "id" | "email" | "userId" | "accountId">,
+  account: Pick<
+    ListedAccount,
+    "id" | "label" | "email" | "userId" | "accountId"
+  >,
 ): string {
   if (account.email) return account.email;
   if (account.userId) return `user:${shortenOpaque(account.userId)}`;
   if (account.accountId) return `acct:${shortenOpaque(account.accountId)}`;
+  if (account.label) return account.label;
   return account.id.slice(0, 8);
 }

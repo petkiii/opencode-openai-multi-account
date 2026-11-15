@@ -6,6 +6,13 @@ export function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
+export function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (isRecord(error) && typeof error.message === "string")
+    return error.message;
+  return String(error);
+}
+
 export function asNumber(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim()) {
@@ -13,13 +20,6 @@ export function asNumber(value: unknown): number | undefined {
     if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
-}
-
-export function sortBy<T>(
-  items: T[],
-  compare: (left: T, right: T) => number,
-): T[] {
-  return [...items].sort(compare);
 }
 
 export function formatIsoDate(timestamp: number): string {
