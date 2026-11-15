@@ -1,465 +1,157 @@
-import { resolvePaths, type ResolvedPaths } from "./paths.js";
-import {
-  awaitDeviceAuthorization,
-  awaitOAuthCallback,
-  createAuthorizationFlow,
-  createDeviceAuthorizationFlow,
-  exchangeAuthorizationInput,
-  extractAccountMetadata,
-  refreshAccessToken,
-} from "./oauth.js";
-import {
-  fetchUsagePayload,
-  isUsageAuthFailure,
-  summarizeUsagePayload,
-  toStoredUsageSnapshot,
-} from "./usage.js";
-import {
-  getCanonicalOpenAIAuth,
-  isOAuthAuth,
-  oauthAuthMatchesStoredAccount,
-  removeCanonicalOpenAIAuth,
-  storedAccountToOAuthAuth,
-  writeCanonicalOpenAIAuth,
-} from "./auth-store.js";
-import {
-  clearUsageSnapshot,
-  listAccounts,
-  readAccountStore,
-  requireAccount,
-  requireSelectedAccount,
-  setUsageSnapshot,
-  upsertAccount,
-  writeAccountStore,
-} from "./store.js";
-import { withFileLock } from "./lock.js";
 import type {
-  AccountStoreState,
-  AuthorizationFlow,
-  DeviceAuthorizationFlow,
-  ListedAccount,
-  StoredAccount,
-  TokenResponse,
-  UsageResult,
-} from "./types.js";
+  IntegrationAttempt,
+  LocationRef,
+  OpenCodeClient,
+} from "@opencode/client";
+import { setTimeout as delay } from "node:timers/promises";
+import { AccountUsage } from "../plugin/rpc.js";
+import {
+  BROWSER_METHOD,
+  DEVICE_METHOD,
+  OPENAI_INTEGRATION,
+  toAccount,
+} from "./accounts.js";
+import type { ListedAccount, UsageResult } from "./types.js";
+import { errorMessage } from "./utils.js";
 
-const REFRESH_MARGIN_MS = 60_000;
-
-export interface AccountManagerOptions {
-  env?: NodeJS.ProcessEnv;
-  now?: () => number;
-  createId?: () => string;
-}
+export type AccountClient = Pick<
+  OpenCodeClient,
+  "credential" | "integration" | "rpc"
+>;
 
 export class AccountManager {
-  readonly paths: ResolvedPaths;
-  private readonly now: () => number;
-  private readonly createId: () => string;
+  constructor(
+    private readonly client: () => AccountClient,
+    private readonly location: LocationRef,
+  ) {}
 
-  constructor(options: AccountManagerOptions = {}) {
-    this.paths = resolvePaths(options.env);
-    this.now = options.now ?? (() => Date.now());
-    this.createId = options.createId ?? (() => crypto.randomUUID());
+  private async nativeAccounts(): Promise<ListedAccount[]> {
+    const credentials = await this.client().credential.list();
+    return credentials.flatMap((credential) => {
+      const account = toAccount(credential);
+      return account ? [account] : [];
+    });
+  }
+
+  private async snapshots(ids: string[], refresh: boolean) {
+    try {
+      return await this.client()
+        .rpc(AccountUsage)
+        .get({ credentialIDs: ids, refresh }, { location: this.location });
+    } catch (cause) {
+      throw new Error(
+        "OpenAI usage component unavailable. Check plugin status or reload OpenCode.",
+        { cause },
+      );
+    }
   }
 
   async listAccounts(): Promise<ListedAccount[]> {
-    const state = await readAccountStore(this.paths.storeFile);
-    return listAccounts(state);
+    const accounts = await this.nativeAccounts();
+    const usageAccounts = accounts.filter((account) => account.usageSupported);
+    if (!usageAccounts.length) return accounts;
+    let snapshots;
+    try {
+      snapshots = await this.snapshots(
+        usageAccounts.map((account) => account.id),
+        false,
+      );
+    } catch (error) {
+      return accounts.map((account) =>
+        account.usageSupported
+          ? {
+              ...account,
+              usageError: errorMessage(error),
+            }
+          : account,
+      );
+    }
+    return accounts.map((account) => {
+      const entry = snapshots.find(
+        (snapshot) => snapshot.credentialID === account.id,
+      );
+      return { ...account, usage: entry?.snapshot, usageError: entry?.error };
+    });
   }
 
-  async importCurrent(
-    options: { select?: boolean } = {},
-  ): Promise<StoredAccount> {
-    return this.withMutationLock(async () => {
-      const auth = await getCanonicalOpenAIAuth(this.paths.openCodeAuthFile);
-      if (!isOAuthAuth(auth)) {
-        throw new Error(
-          "OpenCode canonical openai auth is missing or is not OAuth.",
-        );
-      }
+  async selectAccount(credentialID: string): Promise<void> {
+    await this.client().credential.activate({ credentialID });
+  }
 
-      const metadata = extractAccountMetadata({
-        access_token: auth.access,
-        refresh_token: auth.refresh,
-      });
-      const nowIso = new Date(this.now()).toISOString();
-      const current = await readAccountStore(this.paths.storeFile);
-      const imported = upsertAccount(
-        current,
+  async removeAccount(credentialID: string): Promise<void> {
+    await this.client().credential.remove({ credentialID });
+  }
+
+  async usage(): Promise<UsageResult[]> {
+    const targets = await this.nativeAccounts();
+    const ids = targets
+      .filter((account) => account.usageSupported)
+      .map((account) => account.id);
+    const results = ids.length ? await this.snapshots(ids, true) : [];
+    return targets.map((account) => {
+      const entry = results.find((item) => item.credentialID === account.id);
+      return { account, summary: entry?.snapshot, error: entry?.error };
+    });
+  }
+
+  async startAuthorization(
+    device: boolean,
+    signal?: AbortSignal,
+  ): Promise<IntegrationAttempt> {
+    try {
+      const result = await this.client().integration.oauth.connect(
         {
-          email: metadata.email,
-          userId: metadata.userId,
-          accountId: auth.accountId ?? metadata.accountId,
-          refreshToken: auth.refresh,
-          accessToken: auth.access,
-          expiresAt: auth.expires,
-          enterpriseUrl: auth.enterpriseUrl,
+          integrationID: OPENAI_INTEGRATION,
+          methodID: device ? DEVICE_METHOD : BROWSER_METHOD,
+          location: this.location,
         },
-        nowIso,
-        this.createId,
+        { signal },
       );
-
-      const shouldSelect = options.select || !imported.state.selectedAccountId;
-      const nextState = shouldSelect
-        ? { ...imported.state, selectedAccountId: imported.account.id }
-        : imported.state;
-
-      await writeAccountStore(this.paths.storeFile, nextState);
-      return imported.account;
-    });
-  }
-
-  async createAuthorizationFlow(
-    options: { port?: number; redirectHost?: string } = {},
-  ): Promise<AuthorizationFlow> {
-    return createAuthorizationFlow(options);
-  }
-
-  async addAccountFromAuthorizationInput(
-    flow: AuthorizationFlow,
-    input: string,
-    options: { select?: boolean } = {},
-  ): Promise<StoredAccount> {
-    const tokens = await exchangeAuthorizationInput(
-      input,
-      flow,
-    );
-    return this.addAccountFromTokens(tokens, options);
-  }
-
-  async addAccountFromTokens(
-    tokens: TokenResponse,
-    options: { select?: boolean } = {},
-  ): Promise<StoredAccount> {
-    return this.withMutationLock(async () => {
-      if (!tokens.refresh_token) {
-        throw new Error("OAuth refresh token missing from token exchange.");
-      }
-
-      const metadata = extractAccountMetadata(tokens);
-      const nowMs = this.now();
-      const nowIso = new Date(nowMs).toISOString();
-      const current = await readAccountStore(this.paths.storeFile);
-      const upserted = upsertAccount(
-        current,
-        {
-          email: metadata.email,
-          userId: metadata.userId,
-          accountId: metadata.accountId,
-          refreshToken: tokens.refresh_token,
-          accessToken: tokens.access_token,
-          expiresAt: nowMs + (tokens.expires_in ?? 3600) * 1000,
-        },
-        nowIso,
-        this.createId,
-      );
-
-      const nextState = options.select
-        ? { ...upserted.state, selectedAccountId: upserted.account.id }
-        : upserted.state;
-
-      await writeAccountStore(this.paths.storeFile, nextState);
-      if (options.select) {
-        await writeCanonicalOpenAIAuth(
-          this.paths.openCodeAuthFile,
-          storedAccountToOAuthAuth(upserted.account),
-        );
-      }
-      return upserted.account;
-    });
-  }
-
-  async addAccountFromBrowserFlow(
-    flow: AuthorizationFlow,
-    options: {
-      listenHost?: string;
-      timeoutMs?: number;
-      select?: boolean;
-      signal?: AbortSignal;
-    } = {},
-  ): Promise<StoredAccount> {
-    const tokens = await awaitOAuthCallback(flow, {
-      listenHost: options.listenHost,
-      timeoutMs: options.timeoutMs,
-      signal: options.signal,
-    });
-    return this.addAccountFromTokens(tokens, { select: options.select });
-  }
-
-  async createDeviceAuthorizationFlow(): Promise<DeviceAuthorizationFlow> {
-    return createDeviceAuthorizationFlow();
-  }
-
-  async addAccountViaDeviceCode(
-    flow: DeviceAuthorizationFlow,
-    options: {
-      select?: boolean;
-      timeoutMs?: number;
-      signal?: AbortSignal;
-    } = {},
-  ): Promise<StoredAccount> {
-    const tokens = await awaitDeviceAuthorization(flow, {
-      timeoutMs: options.timeoutMs,
-      signal: options.signal,
-    });
-    return this.addAccountFromTokens(tokens, options);
-  }
-
-  async selectAccount(selector: string): Promise<StoredAccount> {
-    return this.withMutationLock(async () => {
-      const state = await readAccountStore(this.paths.storeFile);
-      const account = requireAccount(state, selector);
-      const refreshed = await this.refreshAccountInState(state, account.id);
-      const nextState = {
-        ...refreshed.state,
-        selectedAccountId: refreshed.account.id,
-      };
-      await writeAccountStore(this.paths.storeFile, nextState);
-      await writeCanonicalOpenAIAuth(
-        this.paths.openCodeAuthFile,
-        storedAccountToOAuthAuth(refreshed.account),
-      );
-      return refreshed.account;
-    });
-  }
-
-  async removeAccount(
-    selector: string,
-    replacementSelector?: string,
-  ): Promise<{
-    removed: StoredAccount;
-    selected?: StoredAccount;
-    clearedCanonicalAuth: boolean;
-  }> {
-    return this.withMutationLock(async () => {
-      const state = await readAccountStore(this.paths.storeFile);
-      const removed = requireAccount(state, selector);
-      const remainingState = clearUsageSnapshot(
-        {
-          ...state,
-          accounts: state.accounts.filter(
-            (account) => account.id !== removed.id,
-          ),
-        },
-        removed.id,
-      );
-
-      const removingSelected = state.selectedAccountId === removed.id;
-      if (!removingSelected) {
-        await writeAccountStore(this.paths.storeFile, remainingState);
-        return { removed, clearedCanonicalAuth: false };
-      }
-
-      if (replacementSelector) {
-        const replacement = requireAccount(remainingState, replacementSelector);
-        const refreshed = await this.refreshAccountInState(
-          remainingState,
-          replacement.id,
-        );
-        const nextState = {
-          ...refreshed.state,
-          selectedAccountId: refreshed.account.id,
-        };
-        await writeAccountStore(this.paths.storeFile, nextState);
-        await writeCanonicalOpenAIAuth(
-          this.paths.openCodeAuthFile,
-          storedAccountToOAuthAuth(refreshed.account),
-        );
-        return {
-          removed,
-          selected: refreshed.account,
-          clearedCanonicalAuth: false,
-        };
-      }
-
-      const nextState = {
-        ...remainingState,
-        selectedAccountId: undefined,
-      };
-      await writeAccountStore(this.paths.storeFile, nextState);
-
-      const canonical = await getCanonicalOpenAIAuth(
-        this.paths.openCodeAuthFile,
-      );
-      const shouldClearCanonical = oauthAuthMatchesStoredAccount(
-        canonical,
-        removed,
-      );
-      if (shouldClearCanonical) {
-        await removeCanonicalOpenAIAuth(this.paths.openCodeAuthFile);
-      }
-
-      return { removed, clearedCanonicalAuth: shouldClearCanonical };
-    });
-  }
-
-  async usage(
-    options: { selector?: string; all?: boolean } = {},
-  ): Promise<UsageResult[]> {
-    const state = await readAccountStore(this.paths.storeFile);
-    if (options.all) {
-      const results: UsageResult[] = [];
-      const errors: string[] = [];
-      for (const account of state.accounts) {
-        try {
-          results.push(await this.fetchUsageForAccount(account.id));
-        } catch (error) {
-          errors.push(
-            `${account.email ?? account.id}: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      }
-      if (!results.length && errors.length) {
-        throw new Error(
-          `Usage refresh failed for all accounts: ${errors.join("; ")}`,
-        );
-      }
-      return results;
+      return result.data;
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      throw error;
     }
-
-    const target = options.selector
-      ? requireAccount(state, options.selector)
-      : requireSelectedAccount(state);
-    return [await this.fetchUsageForAccount(target.id)];
   }
 
-  private async fetchUsageForAccount(accountId: string): Promise<UsageResult> {
-    let account = await this.getFreshAccount(accountId);
-    let response = await fetchUsagePayload(
-      account.accessToken,
-      account.accountId,
-    );
-
-    if (isUsageAuthFailure(response)) {
-      account = await this.forceRefreshAccount(account.id);
-      response = await fetchUsagePayload(
-        account.accessToken,
-        account.accountId,
-      );
-    }
-
-    if (!response.ok) {
-      throw new Error(`Usage request failed: ${response.status}`);
-    }
-
-    const payload = await response.json();
-    const summary = summarizeUsagePayload(payload);
-    await this.persistUsageSnapshot(account.id, summary);
-
-    return {
-      account,
-      summary,
-    };
-  }
-
-  private async persistUsageSnapshot(
-    accountId: string,
-    summary: UsageResult["summary"],
-  ): Promise<void> {
-    await this.withMutationLock(async () => {
-      const state = await readAccountStore(this.paths.storeFile);
-      if (!state.accounts.some((account) => account.id === accountId)) {
-        return;
-      }
-
-      const nextState = setUsageSnapshot(
-        state,
-        accountId,
-        toStoredUsageSnapshot(summary, new Date(this.now()).toISOString()),
-      );
-      await writeAccountStore(this.paths.storeFile, nextState);
-    });
-  }
-
-  private async getFreshAccount(accountId: string): Promise<StoredAccount> {
-    return this.withMutationLock(async () => {
-      const state = await readAccountStore(this.paths.storeFile);
-      const refreshed = await this.refreshAccountInState(state, accountId);
-      if (refreshed.changed) {
-        await writeAccountStore(this.paths.storeFile, refreshed.state);
-        await this.syncCanonicalAuthIfSelected(
-          refreshed.state,
-          refreshed.account,
-        );
-      }
-      return refreshed.account;
-    });
-  }
-
-  private async forceRefreshAccount(accountId: string): Promise<StoredAccount> {
-    return this.withMutationLock(async () => {
-      const state = await readAccountStore(this.paths.storeFile);
-      const refreshed = await this.refreshAccountInState(
-        state,
-        accountId,
-        true,
-      );
-      await writeAccountStore(this.paths.storeFile, refreshed.state);
-      await this.syncCanonicalAuthIfSelected(
-        refreshed.state,
-        refreshed.account,
-      );
-      return refreshed.account;
-    });
-  }
-
-  private async syncCanonicalAuthIfSelected(
-    state: AccountStoreState,
-    account: StoredAccount,
-  ): Promise<void> {
-    if (state.selectedAccountId !== account.id) return;
-
-    const canonical = await getCanonicalOpenAIAuth(this.paths.openCodeAuthFile);
-    if (!isOAuthAuth(canonical)) return;
-
-    await writeCanonicalOpenAIAuth(
-      this.paths.openCodeAuthFile,
-      storedAccountToOAuthAuth(account),
-    );
-  }
-
-  private async refreshAccountInState(
-    state: AccountStoreState,
-    accountId: string,
-    force = false,
-  ): Promise<{
-    state: AccountStoreState;
-    account: StoredAccount;
-    changed: boolean;
-  }> {
-    const account = requireAccount(state, accountId);
-    const shouldRefresh =
-      force || account.expiresAt <= this.now() + REFRESH_MARGIN_MS;
-    if (!shouldRefresh) {
-      return { state, account, changed: false };
-    }
-
-      const tokens = await refreshAccessToken(account.refreshToken);
-    const metadata = extractAccountMetadata(tokens);
-    const updated: StoredAccount = {
-      ...account,
-      email: metadata.email ?? account.email,
-      userId: metadata.userId ?? account.userId,
-      accountId: metadata.accountId ?? account.accountId,
-      refreshToken: tokens.refresh_token ?? account.refreshToken,
-      accessToken: tokens.access_token,
-      expiresAt: this.now() + (tokens.expires_in ?? 3600) * 1000,
-      updatedAt: new Date(this.now()).toISOString(),
-    };
-
-    return {
-      state: {
-        ...state,
-        accounts: state.accounts.map((entry) =>
-          entry.id === updated.id ? updated : entry,
-        ),
+  async cancelAuthorization(attempt: IntegrationAttempt): Promise<void> {
+    await this.client().integration.oauth.cancel(
+      {
+        integrationID: OPENAI_INTEGRATION,
+        attemptID: attempt.attemptID,
+        location: this.location,
       },
-      account: updated,
-      changed: true,
-    };
+      { signal: AbortSignal.timeout(5000) },
+    );
   }
 
-  private async withMutationLock<T>(fn: () => Promise<T>): Promise<T> {
-    return withFileLock(this.paths.locksDir, "state", fn);
+  async waitAuthorization(
+    attempt: IntegrationAttempt,
+    signal: AbortSignal,
+  ): Promise<void> {
+    try {
+      while (true) {
+        signal.throwIfAborted();
+        const response = await this.client().integration.oauth.status(
+          {
+            integrationID: OPENAI_INTEGRATION,
+            attemptID: attempt.attemptID,
+            location: this.location,
+          },
+          { signal },
+        );
+        const status = response.data;
+        if (status.status === "complete") return;
+        if (status.status === "failed") throw new Error(status.message);
+        if (status.status === "expired" || Date.now() >= attempt.time.expires)
+          throw new Error("Authorization expired. Start login again.");
+        await delay(1000, undefined, { signal });
+      }
+    } catch (error) {
+      if (signal.aborted) throw signal.reason;
+      throw error;
+    } finally {
+      await this.cancelAuthorization(attempt).catch(() => {});
+    }
   }
 }

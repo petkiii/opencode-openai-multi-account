@@ -17,6 +17,7 @@ const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 export async function fetchUsagePayload(
   accessToken: string,
   accountId?: string,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const headers = new Headers({
     Authorization: `Bearer ${accessToken}`,
@@ -26,10 +27,14 @@ export async function fetchUsagePayload(
     headers.set("ChatGPT-Account-Id", accountId);
   }
 
-  return fetchWithDeadline(USAGE_URL, {
-    method: "GET",
-    headers,
-  });
+  return fetchWithDeadline(
+    USAGE_URL,
+    {
+      method: "GET",
+      headers,
+    },
+    signal,
+  );
 }
 
 function formatWindowLabel(windowSeconds: number): string {
@@ -114,12 +119,5 @@ export function summarizeUsagePayload(payload: unknown): UsageSummary {
   return {
     planType: isRecord(payload) ? asString(payload.plan_type) : undefined,
     windows,
-    credits:
-      isRecord(payload) && isRecord(payload.credits) ? [payload.credits] : [],
-    raw: payload,
   };
-}
-
-export function isUsageAuthFailure(response: Response): boolean {
-  return response.status === 401 || response.status === 403;
 }

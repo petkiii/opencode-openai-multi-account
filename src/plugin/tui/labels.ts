@@ -5,12 +5,12 @@ import {
 } from "../../core/usage.js";
 import type {
   ListedAccount,
-  StoredAccount,
   StoredUsageSnapshot,
   UsageResult,
-  UsageSummary,
 } from "../../core/types.js";
 import { pad, summarizeExpiry } from "../../core/utils.js";
+
+const UNKNOWN_USAGE = "5h ?? · wk ??";
 
 export function clipText(value: string, max = 34): string {
   return value.length <= max
@@ -18,15 +18,11 @@ export function clipText(value: string, max = 34): string {
     : `${value.slice(0, Math.max(0, max - 3))}...`;
 }
 
-export function accountLabel(
-  account: Pick<StoredAccount, "id" | "email" | "userId" | "accountId">,
-): string {
+export function accountLabel(account: ListedAccount): string {
   return clipText(accountDisplayName(account));
 }
 
-export function sidebarAccountLabel(
-  account: Pick<StoredAccount, "id" | "email" | "userId" | "accountId">,
-): string {
+export function sidebarAccountLabel(account: ListedAccount): string {
   return pad(clipText(accountDisplayName(account), 17), 17);
 }
 
@@ -52,7 +48,7 @@ export function usageSummaryText(
 }
 
 export function usageDetailLines(
-  summary: UsageSummary,
+  summary: StoredUsageSnapshot,
   compact: boolean,
 ): string[] {
   const windows = pickPrimaryUsageWindows(summary.windows);
@@ -86,12 +82,14 @@ export function usageDetailLines(
 
 export function accountDetail(account: ListedAccount, now: number): string {
   return [
-    usageSummaryText(account.usage),
+    account.usageSupported ? usageSummaryText(account.usage) : UNKNOWN_USAGE,
     `exp ${summarizeExpiry(account.expiresAt, now)}`,
   ].join(" · ");
 }
 
 export function sidebarAccountDetail(account: ListedAccount): string {
+  if (!account.usageSupported) return UNKNOWN_USAGE;
+  if (account.usageError) return "usage unavailable";
   return usageSummaryText(account.usage);
 }
 
